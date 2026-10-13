@@ -282,10 +282,15 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    mtx_buffer.lock();
-    scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
+    /* preprocess outside the lock so that imu_cbk is not blocked */
+    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    p_pre->process(msg, ptr);
+    double preprocess_time = omp_get_wtime() - preprocess_start_time;
+
+    mtx_buffer.lock();
+    scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -296,12 +301,10 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
         is_first_lidar = false;
     }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    s_plot11[scan_count] = preprocess_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -310,9 +313,14 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
-    mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
+    /* preprocess outside the lock so that imu_cbk is not blocked */
+    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    p_pre->process(msg, ptr);
+    double preprocess_time = omp_get_wtime() - preprocess_start_time;
+
+    mtx_buffer.lock();
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
@@ -337,12 +345,10 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    s_plot11[scan_count] = preprocess_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -441,6 +447,11 @@ void map_incremental()
     PointVector PointNoNeedDownsample;
     PointToAdd.reserve(feats_down_size);
     PointNoNeedDownsample.reserve(feats_down_size);
+    /* 0: skip, 1: add with downsample, 2: add without downsample */
+    vector<uint8_t> add_flag(feats_down_size, 0);
+    #ifdef MP_EN
+        #pragma omp parallel for num_threads(MP_PROC_NUM) schedule(static)
+    #endif
     for (int i = 0; i < feats_down_size; i++)
     {
         /* transform to world frame */
@@ -457,7 +468,7 @@ void map_incremental()
             mid_point.z = floor(feats_down_world->points[i].z/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
             float dist  = calc_dist(feats_down_world->points[i],mid_point);
             if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min && fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min && fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min){
-                PointNoNeedDownsample.push_back(feats_down_world->points[i]);
+                add_flag[i] = 2;
                 continue;
             }
             for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i ++)
@@ -469,12 +480,17 @@ void map_incremental()
                     break;
                 }
             }
-            if (need_add) PointToAdd.push_back(feats_down_world->points[i]);
+            if (need_add) add_flag[i] = 1;
         }
         else
         {
-            PointToAdd.push_back(feats_down_world->points[i]);
+            add_flag[i] = 1;
         }
+    }
+    for (int i = 0; i < feats_down_size; i++)
+    {
+        if (add_flag[i] == 1)      PointToAdd.push_back(feats_down_world->points[i]);
+        else if (add_flag[i] == 2) PointNoNeedDownsample.push_back(feats_down_world->points[i]);
     }
 
     double st_time = omp_get_wtime();
@@ -495,6 +511,9 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         PointCloudXYZI::Ptr laserCloudWorld( \
                         new PointCloudXYZI(size, 1));
 
+        #ifdef MP_EN
+            #pragma omp parallel for num_threads(MP_PROC_NUM)
+        #endif
         for (int i = 0; i < size; i++)
         {
             RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
@@ -548,6 +567,9 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
 
+    #ifdef MP_EN
+        #pragma omp parallel for num_threads(MP_PROC_NUM)
+    #endif
     for (int i = 0; i < size; i++)
     {
         RGBpointBodyLidarToIMU(&feats_undistort->points[i], \
@@ -566,6 +588,9 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(effct_feat_num, 1));
+    #ifdef MP_EN
+        #pragma omp parallel for num_threads(MP_PROC_NUM)
+    #endif
     for (int i = 0; i < effct_feat_num; i++)
     {
         RGBpointBodyToWorld(&laserCloudOri->points[i], \
@@ -585,6 +610,9 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(size, 1));
 
+    #ifdef MP_EN
+        #pragma omp parallel for num_threads(MP_PROC_NUM)
+    #endif
     for (int i = 0; i < size; i++)
     {
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
@@ -683,8 +711,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     /** closest surface search and residual computation **/
     #ifdef MP_EN
-        omp_set_num_threads(MP_PROC_NUM);
-        #pragma omp parallel for
+        #pragma omp parallel for num_threads(MP_PROC_NUM) schedule(dynamic, 64)
     #endif
     for (int i = 0; i < feats_down_size; i++)
     {
@@ -760,6 +787,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
     ekfom_data.h.resize(effct_feat_num);
 
+    #ifdef MP_EN
+        #pragma omp parallel for num_threads(MP_PROC_NUM)
+    #endif
     for (int i = 0; i < effct_feat_num; i++)
     {
         const PointType &laser_p  = laserCloudOri->points[i];
@@ -917,16 +947,26 @@ public:
         else
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
+        /*** Callback groups: lidar preprocessing, imu input and the main LIO loop run on separate executor threads ***/
+        cb_group_lidar_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_imu_   = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_main_  = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        rclcpp::SubscriptionOptions lidar_sub_opt, imu_sub_opt;
+        lidar_sub_opt.callback_group = cb_group_lidar_;
+        imu_sub_opt.callback_group   = cb_group_imu_;
+
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk, lidar_sub_opt);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            /* MID360 frames are large (~500KB): use reliable QoS so that a lost fragment does not drop the whole frame */
+            rclcpp::QoS lidar_qos = (p_pre->lidar_type == MID360) ? rclcpp::QoS(20) : rclcpp::SensorDataQoS();
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, lidar_qos, standard_pcl_cbk, lidar_sub_opt);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, imu_sub_opt);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -937,12 +977,14 @@ public:
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
-        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this), cb_group_main_);
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this), cb_group_main_);
 
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save",
+            [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res) -> void {this->map_save_callback(req, res);},
+            rmw_qos_profile_services_default, cb_group_main_);
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -957,7 +999,10 @@ public:
 private:
     void timer_callback()
     {
-        if(sync_packages(Measures))
+        mtx_buffer.lock();
+        bool synced = sync_packages(Measures);
+        mtx_buffer.unlock();
+        if(synced)
         {
             if (flg_first_scan)
             {
@@ -1004,6 +1049,9 @@ private:
                 {
                     ikdtree.set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
+                    #ifdef MP_EN
+                        #pragma omp parallel for num_threads(MP_PROC_NUM)
+                    #endif
                     for(int i = 0; i < feats_down_size; i++)
                     {
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
@@ -1143,6 +1191,7 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_lidar_, cb_group_imu_, cb_group_main_;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
@@ -1160,7 +1209,11 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    /* one thread per callback group (lidar / imu / main) */
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    auto node = std::make_shared<LaserMappingNode>();
+    executor.add_node(node);
+    executor.spin();
 
     if (rclcpp::ok())
         rclcpp::shutdown();

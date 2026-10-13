@@ -300,7 +300,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
 
   /*** undistort each lidar point (backward propagation) ***/
   if (pcl_out.points.begin() == pcl_out.points.end()) return;
-  auto it_pcl = pcl_out.points.end() - 1;
+  int i_pcl = pcl_out.points.size() - 1;
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
   {
     auto head = it_kp - 1;
@@ -312,27 +312,35 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     acc_imu<<VEC_FROM_ARRAY(tail->acc);
     angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
 
-    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
+    /* points in (i_pcl, seg_end] belong to this IMU segment */
+    const int seg_end = i_pcl;
+    while (i_pcl >= 0 && pcl_out.points[i_pcl].curvature / double(1000) > head->offset_time) i_pcl--;
+
+    #ifdef MP_EN
+      #pragma omp parallel for num_threads(MP_PROC_NUM)
+    #endif
+    for (int i = i_pcl + 1; i <= seg_end; i++)
     {
-      dt = it_pcl->curvature / double(1000) - head->offset_time;
+      PointType &pt = pcl_out.points[i];
+      double dt_i = pt.curvature / double(1000) - head->offset_time;
 
       /* Transform to the 'end' frame, using only the rotation
        * Note: Compensation direction is INVERSE of Frame's moving direction
        * So if we want to compensate a point at timestamp-i to the frame-e
        * P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
-      M3D R_i(R_imu * Exp(angvel_avr, dt));
+      M3D R_i(R_imu * Exp(angvel_avr, dt_i));
       
-      V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
-      V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);
+      V3D P_i(pt.x, pt.y, pt.z);
+      V3D T_ei(pos_imu + vel_imu * dt_i + 0.5 * acc_imu * dt_i * dt_i - imu_state.pos);
       V3D P_compensate = imu_state.offset_R_L_I.conjugate() * (imu_state.rot.conjugate() * (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);// not accurate!
       
       // save Undistorted points and their rotation
-      it_pcl->x = P_compensate(0);
-      it_pcl->y = P_compensate(1);
-      it_pcl->z = P_compensate(2);
-
-      if (it_pcl == pcl_out.points.begin()) break;
+      pt.x = P_compensate(0);
+      pt.y = P_compensate(1);
+      pt.z = P_compensate(2);
     }
+
+    if (i_pcl < 0) break;
   }
 }
 

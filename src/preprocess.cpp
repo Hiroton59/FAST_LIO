@@ -475,84 +475,67 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
 
 void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
 {
+  /* PointCloud2 from livox_ros_driver2 (xfer_format: 0): x y z intensity tag line timestamp(float64, ns).
+   * Same filtering as avia_handler, reading the raw buffer directly. */
   pl_surf.clear();
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<livox_ros::LivoxPointXyzrtl> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
-  if (plsize == 0)
-    return;
-  pl_surf.reserve(plsize);
-
-  /*** These variables only works when no point timestamps given ***/
-  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
-  std::vector<bool> is_first(N_SCANS, true);
-  std::vector<double> yaw_fp(N_SCANS, 0.0);    // yaw of first scan point
-  std::vector<float> yaw_last(N_SCANS, 0.0);   // yaw of last scan point
-  std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
-  /*****************************************************************/
-
-  given_offset_time = false;
-  double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
-  double yaw_end = yaw_first;
-  int layer_first = pl_orig.points[0].line;
-  for (uint i = plsize - 1; i > 0; i--)
+  int off_x = -1, off_y = -1, off_z = -1, off_i = -1, off_tag = -1, off_line = -1, off_t = -1;
+  for (const auto &f : msg->fields)
   {
-    if (pl_orig.points[i].line == layer_first)
-    {
-      yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
-      break;
-    }
+    if (f.name == "x") off_x = f.offset;
+    else if (f.name == "y") off_y = f.offset;
+    else if (f.name == "z") off_z = f.offset;
+    else if (f.name == "intensity" || f.name == "reflectivity") off_i = f.offset;
+    else if (f.name == "tag") off_tag = f.offset;
+    else if (f.name == "line") off_line = f.offset;
+    else if (f.name == "timestamp") off_t = f.offset;
+  }
+  if (off_x < 0 || off_y < 0 || off_z < 0 || off_i < 0 || off_tag < 0 || off_line < 0 || off_t < 0)
+  {
+    std::cerr << "mid360_handler: PointCloud2 fields do not match livox_ros_driver2 format (xfer_format: 0)" << std::endl;
+    return;
   }
 
-  for (uint i = 0; i < plsize; ++i)
+  const int plsize = msg->width * msg->height;
+  if (plsize == 0) return;
+  const uint32_t step = msg->point_step;
+  const uint8_t *data = msg->data.data();
+  const double base_time_ns = msg->header.stamp.sec * 1e9 + msg->header.stamp.nanosec;
+  auto rd_f = [&](int i, int off) { float v; memcpy(&v, data + i * step + off, sizeof(float)); return v; };
+
+  pl_surf.reserve(plsize / point_filter_num + 1);
+
+  uint valid_num = 0;
+  float last_x = rd_f(0, off_x), last_y = rd_f(0, off_y), last_z = rd_f(0, off_z);
+  for (int i = 1; i < plsize; i++)
   {
+    const uint8_t *pt = data + i * step;
+    const uint8_t line = pt[off_line];
+    const uint8_t tag = pt[off_tag];
+    const float x = rd_f(i, off_x), y = rd_f(i, off_y), z = rd_f(i, off_z);
+    const float px = last_x, py = last_y, pz = last_z;
+    last_x = x; last_y = y; last_z = z;
+
+    if (line >= N_SCANS || !((tag & 0x30) == 0x10 || (tag & 0x30) == 0x00)) continue;
+    valid_num++;
+    if (valid_num % point_filter_num != 0) continue;
+    if (!((fabs(x - px) > 1e-7) || (fabs(y - py) > 1e-7) || (fabs(z - pz) > 1e-7))) continue;
+    if (x * x + y * y + z * z <= blind * blind) continue;
+
+    double t_ns;
+    memcpy(&t_ns, pt + off_t, sizeof(double));
     PointType added_pt;
+    added_pt.x = x;
+    added_pt.y = y;
+    added_pt.z = z;
+    added_pt.intensity = rd_f(i, off_i);
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].reflectivity;
-    added_pt.curvature = 0.;
-
-    int layer = pl_orig.points[i].line;
-    double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
-
-    if (is_first[layer])
-    {
-      // printf("layer: %d; is first: %d", layer, is_first[layer]);
-      yaw_fp[layer] = yaw_angle;
-      is_first[layer] = false;
-      added_pt.curvature = 0.0;
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
-      continue;
-    }
-
-    // compute offset time
-    if (yaw_angle <= yaw_fp[layer])
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-    }
-    else
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
-    }
-
-    if (added_pt.curvature < time_last[layer])
-      added_pt.curvature += 360.0 / omega_l;
-
-    yaw_last[layer] = yaw_angle;
-    time_last[layer] = added_pt.curvature;
-
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
-    {
-      pl_surf.push_back(std::move(added_pt));
-    }
+    added_pt.curvature = (t_ns - base_time_ns) / 1e6;  // use curvature as time of each laser points, curvature unit: ms
+    pl_surf.push_back(added_pt);
   }
 }
 
